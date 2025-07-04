@@ -62,13 +62,15 @@ def format_join_message(rarity, name, channel):
 @client.event
 async def on_voice_state_update(member, before, after):
     if before.channel is None and after.channel:
+        rarity = get_random_rarity()
+
         sb.table("voice_join").insert({
             "guild_id": member.guild.id,
             "user_id": member.id,
-            "channel_id": after.channel.id
+            "channel_id": after.channel.id,
+            "rarity": rarity
         }).execute()
 
-        rarity = get_random_rarity()
         msg = format_join_message(rarity, member.display_name, after.channel.name)
         target = member.guild.text_channels[0]
         await target.send(f"🔔 {msg}", delete_after=60*5)
