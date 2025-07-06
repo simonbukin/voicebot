@@ -1,4 +1,4 @@
-import os, discord, logging, random, asyncio
+import os, discord, logging, random, asyncio, datetime
 from supabase import create_client
 
 TOKEN    = os.getenv("DISCORD_TOKEN")
@@ -8,6 +8,8 @@ SUPA_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 sb = create_client(SUPA_URL, SUPA_KEY)
 
 intents = discord.Intents.default()
+intents.voice_states = True  # we need voice state events
+intents.guilds = True        # guild metadata (channels)
 client = discord.Client(intents=intents)
 logging.basicConfig(level=logging.INFO)
 
@@ -62,11 +64,80 @@ SYMBOL_PAYOUT = {
 
 # Colors for rarity embeds
 RARITY_COLOR = {
-    "common": discord.Colour.from_rgb(255, 255, 255),  # white
-    "uncommon": discord.Colour.from_rgb(192, 192, 192),  # silver
-    "rare": discord.Colour.gold(),  # yellow/gold
-    "mythic": discord.Colour.purple(),  # purple
+    "common": discord.Colour.from_rgb(255, 255, 255),
+    "uncommon": discord.Colour.blue(),
+    "rare": discord.Colour.gold(),
+    "mythic": discord.Colour.purple(),
 }
+
+# -------------------- runtime state -------------------- #
+# Active VC sessions keyed by (guild_id, user_id) => start datetime
+active_sessions: dict[tuple[int, int], datetime.datetime] = {}
+# Scheduled gambling tasks keyed the same way so we can cancel them on leave
+scheduled_rolls: dict[tuple[int, int], asyncio.Task] = {}
+
+# ------------------ helper utilities ------------------ #
+
+def get_bot_spam_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Return the #bot-spam text channel if it exists."""
+    return discord.utils.get(guild.text_channels, name="bot-spam")
+
+
+async def grant_daily_reward(member: discord.Member):
+    """Give a once-per-day reward when the user first joins a VC that day."""
+    today = datetime.date.today()
+
+    try:
+        res = sb.table("daily_reward").select("last_reward_date").eq("user_id", member.id).single().execute()
+        last_str = res.data["last_reward_date"] if res.data else None
+    except Exception:
+        logging.exception("Failed to fetch daily reward record")
+        last_str = None
+
+    if last_str == str(today):
+        return  # already claimed today
+
+    reward = 50.0
+
+    try:
+        # increment balance (fetch current then update)
+        bal_res = sb.table("user_balance").select("balance").eq("user_id", member.id).single().execute()
+        current_balance = bal_res.data["balance"] if bal_res.data else 0.0
+
+        sb.table("user_balance").upsert(
+            {"user_id": member.id, "balance": current_balance + reward},
+            on_conflict="user_id",
+        ).execute()
+
+        sb.table("daily_reward").upsert(
+            {"user_id": member.id, "last_reward_date": str(today)},
+            on_conflict="user_id"
+        ).execute()
+    except Exception:
+        logging.exception("Failed to apply daily reward")
+        return
+
+    channel = get_bot_spam_channel(member.guild) or member.guild.text_channels[0]
+    await channel.send(
+        f"🎁 {member.mention} received their daily login reward of {reward:.2f} doubloons!",
+        delete_after=60 * 5,
+    )
+
+
+async def _delayed_gamble(member: discord.Member):
+    """Waits 120s, then rolls slots if the member is still in any VC."""
+    try:
+        await asyncio.sleep(120)
+        if member.voice and member.voice.channel:
+            rarity = get_random_rarity()
+            channel = get_bot_spam_channel(member.guild) or member.guild.text_channels[0]
+            await handle_slot_spin(member, channel, rarity)
+    except asyncio.CancelledError:
+        # user left before delay elapsed – no roll
+        pass
+    finally:
+        # clean up task from dict
+        scheduled_rolls.pop((member.guild.id, member.id), None)
 
 def spin() -> list[list[str]]:
     """Return a 3x3 grid of random reel symbols."""
@@ -123,7 +194,7 @@ async def handle_slot_spin(member: discord.Member, channel: discord.TextChannel,
     payout = SYMBOL_PAYOUT.get(symbol, 0.0) if win else 0.0
 
     try:
-        sb.table("voice_join").insert({
+        sb.table("gambling_spin").insert({
             "guild_id": member.guild.id,
             "user_id": member.id,
             "channel_id": member.voice.channel.id if member.voice else None,
@@ -135,9 +206,13 @@ async def handle_slot_spin(member: discord.Member, channel: discord.TextChannel,
 
     if payout > 0:
         try:
+            # Fetch current balance and add the payout
+            bal_res = sb.table("user_balance").select("balance").eq("user_id", member.id).single().execute()
+            current_balance = bal_res.data["balance"] if bal_res.data else 0.0
+            
             sb.table("user_balance").upsert({
                 "user_id": member.id,
-                "balance": payout,
+                "balance": current_balance + payout,
             }, on_conflict="user_id").execute()
         except Exception:
             logging.exception("Failed to upsert user balance")
@@ -173,15 +248,69 @@ def format_join_message(rarity, name, channel):
     return f"{name} {phrase} {channel}"
 
 @client.event
-async def on_voice_state_update(member, before, after):
-    if before.channel is None and after.channel:
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    key = (member.guild.id, member.id)
+
+    # -------------------- user joined a VC -------------------- #
+    if before.channel is None and after.channel is not None:
+        # cache session start
+        active_sessions[key] = datetime.datetime.now(datetime.timezone.utc)
+
+        # send join notification immediately
         rarity = get_random_rarity()
-
         join_msg = format_join_message(rarity, member.display_name, after.channel.name)
-        target = member.guild.text_channels[0]
-        embed = discord.Embed(description=f"🔔 {join_msg}", color=RARITY_COLOR.get(rarity, discord.Colour.default()))
-        await target.send(embed=embed, delete_after=60 * 5)
+        join_target = member.guild.text_channels[0]
+        embed = discord.Embed(
+            description=f"🔔 {join_msg}",
+            color=RARITY_COLOR.get(rarity, discord.Colour.default()),
+        )
+        await join_target.send(embed=embed, delete_after=60 * 5)
 
-        await handle_slot_spin(member, target, rarity)
+        # schedule gambling roll after 2 minutes if they remain in VC
+        task = asyncio.create_task(_delayed_gamble(member))
+        scheduled_rolls[key] = task
+
+        # handle daily reward
+        await grant_daily_reward(member)
+
+    # -------------------- user left all VCs ------------------- #
+    elif before.channel is not None and after.channel is None:
+        # cancel any scheduled roll
+        task = scheduled_rolls.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+
+        # compute session duration
+        start_time = active_sessions.pop(key, None)
+        if start_time:
+            end_time = datetime.datetime.now(datetime.timezone.utc)
+            duration = int((end_time - start_time).total_seconds())
+
+            try:
+                sb.table("voice_session").insert(
+                    {
+                        "guild_id": member.guild.id,
+                        "user_id": member.id,
+                        "channel_id": before.channel.id,
+                        "start_time": start_time.isoformat(),
+                        "end_time": end_time.isoformat(),
+                        "duration_seconds": duration,
+                    }
+                ).execute()
+
+                # update aggregate total time
+                res = sb.table("user_total_time").select("total_seconds").eq("user_id", member.id).single().execute()
+                total_prev = res.data["total_seconds"] if res.data else 0
+                sb.table("user_total_time").upsert(
+                    {"user_id": member.id, "total_seconds": total_prev + duration},
+                    on_conflict="user_id",
+                ).execute()
+            except Exception:
+                logging.exception("Failed to record voice session")
+        
+    # -------------------- user switched VCs ------------------ #
+    elif before.channel and after.channel and before.channel != after.channel:
+        # treat as continuous session – no special handling required
+        pass
 
 client.run(TOKEN)
